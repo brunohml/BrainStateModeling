@@ -24,7 +24,7 @@ def find_embeddings_file(animal, patient_id, window_length=60, stride_length=30,
     patient_id_str = f"Epat{patient_id}"
     
     output_dir = os.path.join('output', animal, patient_id_str)
-    version_file = f'embeddings_{patient_id_str}_W{window_length}_S{stride_length}_{data_type}.pkl'
+    version_file = f'embeddings_{patient_id_str}_{window_length}win{stride_length}str_{data_type}.pkl'
     version_path = os.path.join(output_dir, version_file)
     
     if os.path.exists(version_path):
@@ -35,8 +35,8 @@ def find_embeddings_file(animal, patient_id, window_length=60, stride_length=30,
     
     try:
         # Get all files for this patient
-        pattern = os.path.join('source_pickles', animal, 'Epoch*',
-                             f'{window_length}SecondWindow_{stride_length}SecondStride',
+        pattern = os.path.join('source_pickles', animal,
+                             f'{window_length}win{stride_length}str',
                              data_type, f'{patient_id_str}_*.pkl')
         patient_files = glob.glob(pattern)
         
@@ -232,7 +232,7 @@ def process_all_patients(animal, window_length=60, stride_length=30, data_type='
     # First, try to find existing embeddings files
     embeddings_files = []
     for patient_dir in glob.glob(os.path.join(output_dir, 'Epat*')):
-        pattern = os.path.join(patient_dir, f'embeddings_Epat*_W{window_length}_S{stride_length}_{data_type}.pkl')
+        pattern = os.path.join(patient_dir, f'embeddings_Epat*_{window_length}win{stride_length}str_{data_type}.pkl')
         files = glob.glob(pattern)
         embeddings_files.extend(files)
     
@@ -241,8 +241,8 @@ def process_all_patients(animal, window_length=60, stride_length=30, data_type='
         print(f"No existing embeddings found. Attempting to generate them...")
         try:
             # Get all patient files from source directory
-            source_pattern = os.path.join('source_pickles', animal, 'Epoch*',
-                                        f'{window_length}SecondWindow_{stride_length}SecondStride',
+            source_pattern = os.path.join('source_pickles', animal,
+                                        f'{window_length}win{stride_length}str',
                                         data_type, 'Epat*.pkl')
             source_files = glob.glob(source_pattern)
             

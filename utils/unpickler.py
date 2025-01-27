@@ -28,8 +28,8 @@ def parse_timestamp(timestamp_str):
 
 def get_patient_files(base_dir, animal, window_length, stride_length, data_type):
     """Get all pickle files for all patients in the specified directory."""
-    pattern = os.path.join(base_dir, 'source_pickles', animal, f'Epoch*',
-                          f'{window_length}SecondWindow_{stride_length}SecondStride',
+    pattern = os.path.join(base_dir, 'source_pickles', animal,
+                          f'{window_length}win{stride_length}str',
                           data_type, '*.pkl')
     files = glob(pattern)
     
@@ -126,7 +126,7 @@ def process_patient_files(patient_files, animal, patient_id, window_length, stri
         output_data['seizure_labels'] = None
     
     # Save processed data
-    output_filename = f'embeddings_{patient_id}_W{window_length}_S{stride_length}_{data_type}.pkl'
+    output_filename = f'embeddings_{patient_id}_{window_length}win{stride_length}str_{data_type}.pkl'
     output_path = os.path.join(output_dir, output_filename)
     with open(output_path, 'wb') as f:
         pickle.dump(output_data, f)
