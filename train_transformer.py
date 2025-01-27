@@ -4,7 +4,7 @@ import numpy as np
 import pickle
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from torch.nn import MSELoss
+from torch.nn import MSELoss, CosineSimilarity
 from pathlib import Path
 from glob import glob
 import random
@@ -12,6 +12,7 @@ from Transformer import Transformer, ModelArgs
 import logging
 import json
 from datetime import datetime
+import argparse
 
 def collate_fn(batch):
     """Custom collate function to handle sequences and labels."""
@@ -96,8 +97,8 @@ def setup_logging(log_dir):
     )
     return log_file
 
-def split_patients(data_dir, train_ratio=0.7, val_ratio=0.15):
-    """Split patients into train/val/test sets."""
+def split_patients(data_dir, test_patient):
+    """Split patients into train/val/test sets, using all available patients."""
     # Get all unique patient directories under jackal
     patient_dirs = glob(os.path.join(data_dir, 'jackal', 'Epat*'))
     patient_ids = [os.path.basename(d) for d in patient_dirs]
@@ -105,18 +106,25 @@ def split_patients(data_dir, train_ratio=0.7, val_ratio=0.15):
     if not patient_ids:
         raise ValueError("No patient directories found in jackal subdirectory")
     
-    # Shuffle patients
-    random.shuffle(patient_ids)
+    if test_patient not in patient_ids:
+        raise ValueError(f"Test patient {test_patient} not found in data directory")
     
-    # Calculate split indices
-    n_patients = len(patient_ids)
-    n_train = int(n_patients * train_ratio)
-    n_val = int(n_patients * val_ratio)
+    # Remove test patient from available patients
+    patient_ids.remove(test_patient)
     
-    # Split patient IDs
-    train_ids = patient_ids[:n_train]
-    val_ids = patient_ids[n_train:n_train + n_val]
-    test_ids = patient_ids[n_train + n_val:]
+    # Need at least 3 patients total (1 train, 1 val, 1 test)
+    if len(patient_ids) < 2:
+        raise ValueError(f"Not enough patients. Need at least 3 patients, found {len(patient_ids) + 1}")
+    
+    # Randomly select 1 validation patient
+    val_ids = random.sample(patient_ids, 1)
+    
+    # Remove validation patient from remaining pool
+    patient_ids.remove(val_ids[0])
+    
+    # All remaining patients go to training
+    train_ids = patient_ids
+    test_ids = [test_patient]
     
     return train_ids, val_ids, test_ids
 
@@ -145,8 +153,16 @@ def train_epoch(model, train_loader, optimizer, criterion, device):
         # Forward pass
         output = model(sequences)
         
-        # Calculate loss (predicting next timestep)
-        loss = criterion(output[:, :-1, :], sequences[:, 1:, :])
+        # Calculate cosine loss (predicting next timestep)
+        # Reshape tensors for cosine similarity calculation
+        output_flat = output[:, :-1, :].reshape(-1, output.size(-1))
+        target_flat = sequences[:, 1:, :].reshape(-1, sequences.size(-1))
+        
+        # Calculate cosine similarity (returns values between -1 and 1)
+        cos_sim = criterion(output_flat, target_flat)
+        
+        # Convert to loss (1 - cos_sim to minimize, mean across all timesteps)
+        loss = (1 - cos_sim).mean()
         
         # Backward pass
         optimizer.zero_grad()
@@ -176,7 +192,12 @@ def validate(model, val_loader, criterion, device):
             batch_size = sequences.size(0)
             
             output = model(sequences)
-            loss = criterion(output[:, :-1, :], sequences[:, 1:, :])
+            
+            # Calculate cosine loss
+            output_flat = output[:, :-1, :].reshape(-1, output.size(-1))
+            target_flat = sequences[:, 1:, :].reshape(-1, sequences.size(-1))
+            cos_sim = criterion(output_flat, target_flat)
+            loss = (1 - cos_sim).mean()
             
             total_loss += loss.item() * batch_size
     
@@ -203,34 +224,40 @@ def save_checkpoint(model, optimizer, epoch, loss, checkpoint_dir, is_best=False
         torch.save(checkpoint, best_path)
 
 def main():
+    # Add argument parsing
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--test_pat', type=int, required=True, 
+                       help='Patient number to use for testing (e.g., 1 for Epat1)')
+    args = parser.parse_args()
+    
+    # Construct full patient ID
+    test_patient = f"Epat{args.test_pat}"
+    
     # Training settings
     config = {
         'data_dir': 'output',
         'log_dir': 'logs',
         'checkpoint_dir': 'checkpoints',
-        'sequence_length': 10,
+        'sequence_length': 32,
         'batch_size': 32,
         'learning_rate': 1e-4,
-        'num_epochs': 100,
+        'num_epochs': 50,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'model_dim': 512,  # Match the embedding dimension
-        'n_layers': 8,
-        'n_heads': 8,
-        'train_ratio': 0.7,
-        'val_ratio': 0.15
+        'n_layers': 16,
+        'n_heads': 16
     }
     
     # Setup logging
     log_file = setup_logging(config['log_dir'])
     logging.info(f"Starting training with config: {json.dumps(config, indent=2)}")
+    logging.info(f"Test patient: {test_patient}")
     
-    # Split patients
-    train_ids, val_ids, test_ids = split_patients(
-        config['data_dir'], 
-        config['train_ratio'], 
-        config['val_ratio']
-    )
-    logging.info(f"Train patients: {len(train_ids)}, Val patients: {len(val_ids)}, Test patients: {len(test_ids)}")
+    # Split patients with fixed sizes
+    train_ids, val_ids, test_ids = split_patients(config['data_dir'], test_patient)
+    logging.info(f"Train patients: {train_ids}")
+    logging.info(f"Val patients: {val_ids}")
+    logging.info(f"Test patients: {test_ids}")
     
     # Get data files
     train_files = get_embeddings_files(config['data_dir'], train_ids)
@@ -262,7 +289,7 @@ def main():
     
     model = Transformer(model_args).to(config['device'])
     optimizer = AdamW(model.parameters(), lr=config['learning_rate'])
-    criterion = MSELoss()
+    criterion = CosineSimilarity(dim=1)
     
     # Training loop
     best_val_loss = float('inf')
