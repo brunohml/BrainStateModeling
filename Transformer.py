@@ -33,9 +33,6 @@ class ModelArgs:
         max_batch_size: int = 32,
         max_seq_len: int = 2048,
         device: int = None,
-        # Pre-ictal attention parameters
-        pre_ictal_window: int = 10,
-        pre_ictal_bias: float = 2.0,
         **kwargs):
 
         super().__init__()
@@ -52,9 +49,6 @@ class ModelArgs:
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self.device = device
-        # Pre-ictal attention parameters
-        self.pre_ictal_window = pre_ictal_window
-        self.pre_ictal_bias = pre_ictal_bias
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -121,30 +115,51 @@ class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        self.n_local_heads = args.n_heads
-        self.n_local_kv_heads = self.n_kv_heads
+        # model_parallel_size = fs_init.get_model_parallel_world_size()
+        self.n_local_heads = args.n_heads # // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads # // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
+
         self.device = args.device
-        
-        # Pre-ictal attention parameters
-        self.pre_ictal_window = getattr(args, 'pre_ictal_window', 10)
-        self.pre_ictal_bias = getattr(args, 'pre_ictal_bias', 2.0)
 
+        # self.wq = ColumnParallelLinear(
+        #     args.dim,
+        #     args.n_heads * self.head_dim,
+        #     bias=False,
+        #     gather_output=False,
+        #     init_method=lambda x: x,
+        # )
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+
+
+        # self.wk = ColumnParallelLinear(
+        #     args.dim,
+        #     self.n_kv_heads * self.head_dim,
+        #     bias=False,
+        #     gather_output=False,
+        #     init_method=lambda x: x,
+        # )
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+
+
+        # self.wv = ColumnParallelLinear(
+        #     args.dim,
+        #     self.n_kv_heads * self.head_dim,
+        #     bias=False,
+        #     gather_output=False,
+        #     init_method=lambda x: x,
+        # )
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+
+        # self.wo = RowParallelLinear(
+        #     args.n_heads * self.head_dim,
+        #     args.dim,
+        #     bias=False,
+        #     input_is_parallel=True,
+        #     init_method=lambda x: x,
+        # )
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
-
-        # Add layer normalization
-        self.attention_norm = nn.LayerNorm(args.dim)
-        self.ffn_norm = nn.LayerNorm(args.dim)
-
-        # Initialize weights using Xavier uniform initialization
-        nn.init.xavier_uniform_(self.wq.weight, gain=1/math.sqrt(2))
-        nn.init.xavier_uniform_(self.wk.weight, gain=1/math.sqrt(2))
-        nn.init.xavier_uniform_(self.wv.weight, gain=1/math.sqrt(2))
-        nn.init.xavier_uniform_(self.wo.weight, gain=1/math.sqrt(2))
 
         self.cache_k = torch.zeros(
             (
@@ -164,40 +179,14 @@ class Attention(nn.Module):
             )
         ).to(self.device)
 
-    def apply_pre_ictal_bias(self, scores, seizure_labels=None):
-        """Apply attention bias to pre-ictal sequences."""
-        if seizure_labels is None:
-            return scores
-            
-        # Create attention bias tensor
-        bias = torch.zeros_like(scores)  # Shape: [bs, n_heads, seqlen, cache_len + seqlen]
-        
-        # For each sequence in the batch
-        for i in range(seizure_labels.size(0)):
-            # Find indices where seizures occur
-            seizure_indices = torch.where(seizure_labels[i] == 1)[0]
-            
-            if len(seizure_indices) > 0:
-                for seizure_idx in seizure_indices:
-                    # Mark pre-ictal window with bias
-                    start_idx = max(0, seizure_idx - self.pre_ictal_window)
-                    # Add bias to attention scores for pre-ictal tokens
-                    bias[i, :, start_idx:seizure_idx + 1, start_idx:seizure_idx + 1] = self.pre_ictal_bias
-        
-        return scores + bias
-
     def forward(
         self,
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        seizure_labels: Optional[torch.Tensor] = None,
-        return_attW: bool = False
+        return_attW: bool=False
     ):
-        # Apply layer normalization before attention
-        x = self.attention_norm(x)
-        
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -207,8 +196,8 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq).detach()
-        self.cache_v = self.cache_v.to(xq).detach()
+        self.cache_k = self.cache_k.to(xq).detach()  ##################### GWJ added the detach()
+        self.cache_v = self.cache_v.to(xq).detach()  ##################### GWJ added the detach()
 
         self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
         self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
@@ -217,28 +206,21 @@ class Attention(nn.Module):
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.n_rep)
-        values = repeat_kv(values, self.n_rep)
+        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
-        xq = xq.transpose(1, 2)
-        keys = keys.transpose(1, 2)
-        values = values.transpose(1, 2)
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
-        # Apply pre-ictal attention bias
-        scores = self.apply_pre_ictal_bias(scores, seizure_labels)
-        
         if mask is not None:
-            scores = scores + mask
+            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)
+        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         
-        # Apply layer normalization after attention
-        output = self.ffn_norm(output)
-        
         if return_attW:
-            scores_meanHeads_lastRow = torch.mean(scores[:, :, -1, :], dim=1)
+            scores_meanHeads_lastRow = torch.mean(scores[:, :, -1, :], dim=1) # How much does i attend to j, so last row is how much does last token attend to all previous tokens... right?
             return self.wo(output), scores_meanHeads_lastRow
         else:
             return self.wo(output)
@@ -276,17 +258,7 @@ class FeedForward(nn.Module):
         # )
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
-        # Add layer normalization
-        self.layer_norm = nn.LayerNorm(dim)
-
-        # Initialize weights using Xavier uniform initialization
-        nn.init.xavier_uniform_(self.w1.weight, gain=1/math.sqrt(2))
-        nn.init.xavier_uniform_(self.w2.weight, gain=1/math.sqrt(2))
-        nn.init.xavier_uniform_(self.w3.weight, gain=1/math.sqrt(2))
-
     def forward(self, x):
-        # Apply layer normalization
-        x = self.layer_norm(x)
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
         # return self.w2(F.tanh(self.w1(x)) * self.w3(x))           ############################ SWITCHED TO TANH ######################
 
@@ -315,32 +287,19 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        seizure_labels: Optional[torch.Tensor] = None,
-        return_attW: bool = False
+        return_attW: bool=False
     ):
+
         if return_attW:
-            h, scores_meanHeads_lastRow = self.attention(
-                self.attention_norm(x), 
-                start_pos, 
-                freqs_cis, 
-                mask, 
-                seizure_labels=seizure_labels,
-                return_attW=True
-            )
+            h, scores_meanHeads_lastRow = self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, return_attW=True)
             h = x + h
             out = h + self.feed_forward(self.ffn_norm(h))
             return out, scores_meanHeads_lastRow
+
         else:
-            h = x + self.attention(
-                self.attention_norm(x), 
-                start_pos, 
-                freqs_cis, 
-                mask, 
-                seizure_labels=seizure_labels,
-                return_attW=False
-            )
+            h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, return_attW=False)
             out = h + self.feed_forward(self.ffn_norm(h))
-            return out
+            return out            
 
 
 class Transformer(nn.Module):
@@ -390,61 +349,65 @@ class Transformer(nn.Module):
     def forward(
         self, 
         h_in_vae: torch.Tensor, 
-        start_pos: int = 0, 
-        return_attW: bool = False,
-        attention_dropout: float = 0.0,
-        seizure_labels: Optional[torch.Tensor] = None
-    ):
+        start_pos: int=0, 
+        return_attW: bool=False,
+        attention_dropout: float=0.0
+        ):
+        # _bsz, seqlen = tokens.shape
+        # h = self.tok_embeddings(tokens)
+
+        # h = self.input_mlp(h_in_vae)
         h = h_in_vae
+
+        # h is brainstate embeddings: expected shape of [batch, seq, embed_dim]
         seqlen = h.shape[1] 
         self.freqs_cis = self.freqs_cis.to(self.device).detach()
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
         if seqlen > 1:
-            # Create causal mask of shape (1, 1, seqlen, seqlen)
             mask = torch.full((seqlen, seqlen), float("-inf"), device=self.device)
+
             mask = torch.triu(mask, diagonal=1)
-            # Reshape mask for broadcasting across batch size and heads
-            mask = mask.unsqueeze(0).unsqueeze(0)
-            
-            # When using start_pos (for caching), adjust mask
-            if start_pos > 0:
-                mask = torch.hstack([
-                    torch.zeros((1, 1, seqlen, start_pos), device=self.device),
-                    mask
-                ])
+
+            # When performing key-value caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size
+            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            mask = torch.hstack(
+                [torch.zeros((seqlen, start_pos), device=self.device), mask]
+            ).type_as(h)
 
             # Apply attention dropout
             if attention_dropout > 0:
                 mask = attention_mask_dropout(mask, attention_dropout)
+            
 
         if return_attW:
             layer_count = 0
             for layer in self.layers:
                 if layer_count == 0:
-                    h, scores_firstLayer_meanHeads_lastRow = layer(
-                        h, start_pos, freqs_cis, mask, 
-                        seizure_labels=seizure_labels, 
-                        return_attW=True
-                    )
+                    h, scores_firstLayer_meanHeads_lastRow = layer(h, start_pos, freqs_cis, mask, return_attW=True)
                 else:
-                    h = layer(
-                        h, start_pos, freqs_cis, mask, 
-                        seizure_labels=seizure_labels, 
-                        return_attW=False
-                    )
-                layer_count += 1
+                    h = layer(h, start_pos, freqs_cis, mask, return_attW=False)
+                layer_count = layer_count + 1
             h = self.norm(h)
-            return h, scores_firstLayer_meanHeads_lastRow
+
+            # output = self.output_mlp(h)
+            output = h
+            # output = self.tanh(h)          ##################################### Added tanh #########################################
+
+            return output, scores_firstLayer_meanHeads_lastRow
+
         else:
             for layer in self.layers:
-                h = layer(
-                    h, start_pos, freqs_cis, mask, 
-                    seizure_labels=seizure_labels, 
-                    return_attW=False
-                )
+                h = layer(h, start_pos, freqs_cis, mask, return_attW=False)
             h = self.norm(h)
-            return h
+
+            # output = self.output_mlp(h)
+            output = h
+            # output = self.tanh(h)          ##################################### Added tanh #########################################
+
+            return output
 
             
