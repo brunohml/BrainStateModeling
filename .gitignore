@@ -1,0 +1,12 @@
+# Data
+output/
+source_pickles/
+metadata/
+logs/
+checkpoints/
+training_plots/
+
+#Misc
+utils/__pycache__/unpickler.cpython-311.pyc
+BSE_BrainHack.code-workspace
+image.png
