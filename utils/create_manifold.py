@@ -7,7 +7,7 @@ import os
 import matplotlib.pyplot as plt
 import argparse
 import pandas as pd
-from utils.unpickler import process_patient_files as unpack_single_patient
+from unpickler import process_patient_files as unpack_single_patient
 import re
 import glob
 
