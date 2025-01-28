@@ -379,8 +379,8 @@ class Transformer(nn.Module):
             ).type_as(h)
 
             # Apply attention dropout
-            if attention_dropout > 0:
-                mask = attention_mask_dropout(mask, attention_dropout)
+            # if attention_dropout > 0:
+            #    mask = attention_mask_dropout(mask, attention_dropout)
             
 
         if return_attW:

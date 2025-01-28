@@ -13,6 +13,7 @@ import logging
 import json
 from datetime import datetime
 import argparse
+import matplotlib.pyplot as plt
 
 def collate_fn(batch):
     """Custom collate function to handle sequences and labels."""
@@ -34,41 +35,58 @@ def collate_fn(batch):
     return sequences
 
 class BrainStateDataset(Dataset):
-    def __init__(self, embeddings_files, sequence_length=10):
+    def __init__(self, embeddings_files, sequence_length=16):
         self.sequence_length = sequence_length
         self.data = []
         self.seizure_labels = []
+        
+        total_sequences = 0
+        total_files = 0
         
         for file_path in embeddings_files:
             with open(file_path, 'rb') as f:
                 data = pickle.load(f)
                 
             embeddings = data['patient_embeddings']  # Shape: (n_files, n_timepoints, n_features)
+            file_indices = data['file_indices']
             seizure_labels = data.get('seizure_labels', None)
             
-            # Flatten the first two dimensions (files and timepoints)
             n_files, n_timepoints, n_features = embeddings.shape
-            embeddings_flat = embeddings.reshape(-1, n_features)
+            total_files += n_files
             
-            # Get sequences of consecutive windows
-            total_windows = len(embeddings_flat)
-            for i in range(0, total_windows - sequence_length + 1):
-                sequence = embeddings_flat[i:i + sequence_length]
-                self.data.append(sequence)
+            logging.info(f"Processing file {file_path}")
+            logging.info(f"Contains {n_files} files with {n_timepoints} timepoints each")
+            
+            # Process each file separately
+            for file_idx in range(n_files):
+                file_embeddings = embeddings[file_idx]  # Shape: (n_timepoints, n_features)
                 
-                if seizure_labels is not None:
-                    # Flatten seizure labels if they exist
-                    seizure_labels_flat = np.array(seizure_labels).reshape(-1)
-                    label_sequence = seizure_labels_flat[i:i + sequence_length]
-                    # Convert to binary: 1 if any window in sequence has seizure
-                    has_seizure = int(np.any(label_sequence == 1))
-                    self.seizure_labels.append(has_seizure)
+                # Create sliding windows with stride 1
+                n_windows = n_timepoints - sequence_length + 1
+                for window_start in range(n_windows):
+                    window = file_embeddings[window_start:window_start + sequence_length]
+                    self.data.append(window)
+                    total_sequences += 1
+                    
+                    if seizure_labels is not None:
+                        # Get labels for this window
+                        file_labels = seizure_labels[file_idx]
+                        if np.isscalar(file_labels):
+                            has_seizure = int(file_labels == 1)
+                            self.seizure_labels.append(has_seizure)
+                        else:
+                            window_labels = file_labels[window_start:window_start + sequence_length]
+                            has_seizure = int(np.any(window_labels == 1))
+                            self.seizure_labels.append(has_seizure)
         
         self.data = [torch.FloatTensor(seq) for seq in self.data]
         if self.seizure_labels:
             self.seizure_labels = torch.LongTensor(self.seizure_labels)
         else:
             self.seizure_labels = None
+            
+        logging.info(f"Created dataset with {total_sequences} sequences from {total_files} files")
+        logging.info(f"Average sequences per file: {total_sequences/total_files:.1f}")
 
     def __len__(self):
         return len(self.data)
@@ -80,12 +98,15 @@ class BrainStateDataset(Dataset):
             return sequence, label
         return sequence
 
-def setup_logging(log_dir):
+def setup_logging():
+    # Create timestamp for this run
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_dir = os.path.join('logs', timestamp)
+    
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = os.path.join(log_dir, f'training_{timestamp}.log')
+    log_file = os.path.join(log_dir, 'training.log')
     
     logging.basicConfig(
         level=logging.INFO,
@@ -95,7 +116,7 @@ def setup_logging(log_dir):
             logging.StreamHandler()
         ]
     )
-    return log_file
+    return log_dir
 
 def split_patients(data_dir, test_patient):
     """Split patients into train/val/test sets, using all available patients."""
@@ -139,6 +160,9 @@ def get_embeddings_files(data_dir, patient_ids):
 def train_epoch(model, train_loader, optimizer, criterion, device):
     model.train()
     total_loss = 0
+    total_batches = len(train_loader)
+    
+    logging.info(f"Training on {len(train_loader.dataset)} examples in {total_batches} batches")
     
     for batch_idx, batch in enumerate(train_loader):
         if isinstance(batch, tuple):
@@ -151,18 +175,18 @@ def train_epoch(model, train_loader, optimizer, criterion, device):
         batch_size = sequences.size(0)
         
         # Forward pass
-        output = model(sequences)
+        output = model(sequences)  # Shape: [batch_size, seq_len, dim]
         
-        # Calculate cosine loss (predicting next timestep)
-        # Reshape tensors for cosine similarity calculation
-        output_flat = output[:, :-1, :].reshape(-1, output.size(-1))
-        target_flat = sequences[:, 1:, :].reshape(-1, sequences.size(-1))
+        # Calculate cosine loss between predicted and actual states
+        output_flat = output.reshape(-1, output.size(-1))
+        target_flat = sequences.reshape(-1, sequences.size(-1))
         
         # Calculate cosine similarity (returns values between -1 and 1)
         cos_sim = criterion(output_flat, target_flat)
         
-        # Convert to loss (1 - cos_sim to minimize, mean across all timesteps)
-        loss = (1 - cos_sim).mean()
+        # Convert to loss (1 - cos_sim to minimize)
+        base_loss = 1 - cos_sim
+        loss = base_loss.mean()
         
         # Backward pass
         optimizer.zero_grad()
@@ -172,16 +196,19 @@ def train_epoch(model, train_loader, optimizer, criterion, device):
         total_loss += loss.item() * batch_size
         
         if batch_idx % 100 == 0:
-            logging.info(f'Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.6f}')
+            logging.info(f'Batch {batch_idx}/{total_batches}, Loss: {loss.item():.6f}')
     
     return total_loss / len(train_loader.dataset)
 
 def validate(model, val_loader, criterion, device):
     model.eval()
     total_loss = 0
+    total_batches = len(val_loader)
+    
+    logging.info(f"Validating on {len(val_loader.dataset)} examples in {total_batches} batches")
     
     with torch.no_grad():
-        for batch in val_loader:
+        for batch_idx, batch in enumerate(val_loader):
             if isinstance(batch, tuple):
                 sequences, labels = batch
             else:
@@ -191,13 +218,16 @@ def validate(model, val_loader, criterion, device):
             sequences = sequences.to(device)
             batch_size = sequences.size(0)
             
+            # Forward pass
             output = model(sequences)
             
-            # Calculate cosine loss
-            output_flat = output[:, :-1, :].reshape(-1, output.size(-1))
-            target_flat = sequences[:, 1:, :].reshape(-1, sequences.size(-1))
+            # Calculate cosine loss between predicted and actual states
+            output_flat = output.reshape(-1, output.size(-1))
+            target_flat = sequences.reshape(-1, sequences.size(-1))
+            
             cos_sim = criterion(output_flat, target_flat)
-            loss = (1 - cos_sim).mean()
+            base_loss = 1 - cos_sim
+            loss = base_loss.mean()
             
             total_loss += loss.item() * batch_size
     
@@ -223,6 +253,18 @@ def save_checkpoint(model, optimizer, epoch, loss, checkpoint_dir, is_best=False
         best_path = os.path.join(checkpoint_dir, 'best_model.pt')
         torch.save(checkpoint, best_path)
 
+def plot_losses(train_losses, val_losses, save_path):
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(save_path)
+    plt.close()
+
 def main():
     # Add argument parsing
     parser = argparse.ArgumentParser()
@@ -233,23 +275,24 @@ def main():
     # Construct full patient ID
     test_patient = f"Epat{args.test_pat}"
     
+    # Setup logging first
+    log_dir = setup_logging()
+    
     # Training settings
     config = {
         'data_dir': 'output',
-        'log_dir': 'logs',
-        'checkpoint_dir': 'checkpoints',
-        'sequence_length': 32,
+        'log_dir': log_dir,  # Use the timestamped log directory
+        'checkpoint_dir': os.path.join(log_dir, 'checkpoints'),  # Save checkpoints in the same directory
+        'sequence_length': 16,
         'batch_size': 32,
-        'learning_rate': 1e-4,
+        'learning_rate': 1e-6,
         'num_epochs': 50,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'model_dim': 512,  # Match the embedding dimension
-        'n_layers': 16,
-        'n_heads': 16
+        'n_layers': 8,
+        'n_heads': 8
     }
     
-    # Setup logging
-    log_file = setup_logging(config['log_dir'])
     logging.info(f"Starting training with config: {json.dumps(config, indent=2)}")
     logging.info(f"Test patient: {test_patient}")
     
@@ -258,6 +301,7 @@ def main():
     logging.info(f"Train patients: {train_ids}")
     logging.info(f"Val patients: {val_ids}")
     logging.info(f"Test patients: {test_ids}")
+    
     
     # Get data files
     train_files = get_embeddings_files(config['data_dir'], train_ids)
@@ -291,17 +335,23 @@ def main():
     optimizer = AdamW(model.parameters(), lr=config['learning_rate'])
     criterion = CosineSimilarity(dim=1)
     
-    # Training loop
+    # Initialize lists to store losses
+    train_losses = []
+    val_losses = []
     best_val_loss = float('inf')
+    
+    # Training loop
     for epoch in range(config['num_epochs']):
         logging.info(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
         
         # Train
         train_loss = train_epoch(model, train_loader, optimizer, criterion, config['device'])
+        train_losses.append(train_loss)
         logging.info(f"Training Loss: {train_loss:.6f}")
         
         # Validate
         val_loss = validate(model, val_loader, criterion, config['device'])
+        val_losses.append(val_loss)
         logging.info(f"Validation Loss: {val_loss:.6f}")
         
         # Save checkpoint
@@ -314,6 +364,9 @@ def main():
             model, optimizer, epoch, val_loss,
             config['checkpoint_dir'], is_best
         )
+        
+        # Update and save the loss plot after each epoch
+        plot_losses(train_losses, val_losses, os.path.join(config['log_dir'], 'loss_plot.png'))
     
     logging.info("Training completed!")
 
